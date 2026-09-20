@@ -85,7 +85,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
 import * as d3 from 'd3'
 import { useEtymologyStore, LANGUAGE_FAMILIES } from './store/etymology'
 
@@ -93,23 +93,80 @@ const store = useEtymologyStore()
 const svgRef = ref<SVGSVGElement | null>(null)
 const COLORS: Record<string, string> = { ie: '#3b82f6', st: '#22c55e', aa: '#f59e0b', ural: '#8b5cf6' }
 
+const SVG_H = 460
+let simulation: d3.Simulation<any, any> | null = null
+let resizeObserver: ResizeObserver | null = null
+let mountTimer: ReturnType<typeof setTimeout> | null = null
+let renderTimer: ReturnType<typeof setTimeout> | null = null
+let lastWidth = 0
+// 记录节点最新坐标，重绘（尺寸变化/筛选切换）时按 id 恢复，避免拖动后坐标丢失
+const nodePositions = new Map<string, { x: number; y: number }>()
+
+function containerWidth() {
+  return svgRef.value?.getBoundingClientRect().width || 700
+}
+
+// 停止旧模拟、退出旧事件监听，让重绘和停止跟随页面生命周期
+function teardownGraph() {
+  if (simulation) {
+    simulation.stop()
+    simulation = null
+  }
+  if (svgRef.value) {
+    const svg = d3.select(svgRef.value)
+    svg.on('.zoom', null)
+    svg.property('__zoom', d3.zoomIdentity) // 复位缩放状态，避免上一轮 transform 遗留越滚越偏
+    svg.selectAll('*').remove()
+  }
+}
+
 function drawGraph() {
   if (!svgRef.value) return
+  teardownGraph()
   const svg = d3.select(svgRef.value)
-  svg.selectAll('*').remove()
-  const W = svgRef.value.getBoundingClientRect().width || 700, H = 460
-  const nodes = store.graph.nodes.map((n: any) => ({ ...n }))
-  const links = store.graph.links.map((l: any) => ({ ...l }))
+  const W = containerWidth(), H = SVG_H
+  lastWidth = W
+
+  const { nodes: rawNodes, links: rawLinks } = store.filteredGraph
+  if (!rawNodes.length) {
+    svg.append('text')
+      .attr('x', W / 2).attr('y', H / 2)
+      .attr('text-anchor', 'middle').attr('fill', '#64748b').attr('font-size', 13)
+      .text('暂无该语系的词源数据')
+    return
+  }
+
+  const nodes = rawNodes.map((n: any) => {
+    const p = nodePositions.get(n.id)
+    return p ? { ...n, x: p.x, y: p.y } : { ...n }
+  })
+  const links = rawLinks.map((l: any) => ({ ...l }))
+  const restored = nodes.some((n: any) => n.x !== undefined)
+
   const sim = d3.forceSimulation(nodes as any)
     .force('link', d3.forceLink(links as any).id((d: any) => d.id).distance(55))
     .force('charge', d3.forceManyBody().strength(-100))
     .force('center', d3.forceCenter(W / 2, H / 2))
     .force('collision', d3.forceCollide(22))
+  if (restored) sim.alpha(0.35) // 已有坐标的重绘只轻微重排，避免节点被甩飞
+  simulation = sim
+
   const g = svg.append('g')
-  svg.call(d3.zoom<SVGSVGElement, unknown>().scaleExtent([0.2, 3]).on('zoom', (e) => g.attr('transform', e.transform)) as any)
+  const zoom = d3.zoom<SVGSVGElement, unknown>()
+    .scaleExtent([0.2, 3])
+    // 节点上的按下/触摸交给拖拽，不触发画布平移（滚轮缩放不受影响），避免拖动后坐标错位
+    .filter((e: any) => {
+      if (e.button || (e.ctrlKey && e.type !== 'wheel')) return false
+      if (e.type !== 'wheel' && (e.target as Element)?.closest?.('.node')) return false
+      return true
+    })
+    .on('zoom', (e) => g.attr('transform', e.transform))
+  svg.call(zoom as any)
+
   const link = g.append('g').selectAll('line').data(links).join('line')
     .attr('stroke', '#475569').attr('stroke-width', 1).attr('opacity', 0.5)
   const node = g.append('g').selectAll('g').data(nodes).join('g')
+    .attr('class', 'node')
     .call(d3.drag<any, any>()
       .on('start', (e, d: any) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y })
       .on('drag', (e, d: any) => { d.fx = e.x; d.fy = e.y })
@@ -126,8 +183,36 @@ function drawGraph() {
     link.attr('x1', (d: any) => d.source.x).attr('y1', (d: any) => d.source.y)
       .attr('x2', (d: any) => d.target.x).attr('y2', (d: any) => d.target.y)
     node.attr('transform', (d: any) => `translate(${d.x},${d.y})`)
+    nodes.forEach((n: any) => { if (n.x != null && n.y != null) nodePositions.set(n.id, { x: n.x, y: n.y }) })
   })
 }
 
-onMounted(() => { setTimeout(drawGraph, 100) })
+// 快速连续切换/尺寸抖动时合并重绘，每次重绘前都会先停掉上一轮模拟
+function scheduleRender(delay = 120) {
+  if (renderTimer) clearTimeout(renderTimer)
+  renderTimer = setTimeout(() => { renderTimer = null; drawGraph() }, delay)
+}
+
+watch(() => store.selectedFamily, () => scheduleRender())
+
+onMounted(() => {
+  mountTimer = setTimeout(() => { mountTimer = null; drawGraph() }, 100)
+  if (svgRef.value) {
+    lastWidth = containerWidth()
+    resizeObserver = new ResizeObserver(() => {
+      const w = containerWidth()
+      if (Math.abs(w - lastWidth) < 2) return // 忽略亚像素抖动，仅尺寸真正变化时按当前容器重排
+      scheduleRender(150)
+    })
+    resizeObserver.observe(svgRef.value)
+  }
+})
+
+onBeforeUnmount(() => {
+  if (mountTimer) { clearTimeout(mountTimer); mountTimer = null }
+  if (renderTimer) { clearTimeout(renderTimer); renderTimer = null }
+  resizeObserver?.disconnect()
+  resizeObserver = null
+  teardownGraph()
+})
 </script>

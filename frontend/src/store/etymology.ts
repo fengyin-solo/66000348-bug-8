@@ -18,5 +18,15 @@ export const useEtymologyStore = defineStore('etymology', () => {
     })
   )
 
-  return { graph, selectedNode, searchQuery, selectedFamily, filteredCognates }
+  // 力导向网络跟随语系筛选；空结果时返回空节点/边，由视图层兜底
+  const filteredGraph = computed(() => {
+    const g = graph.value
+    if (selectedFamily.value === 'all') return g
+    const nodes = g.nodes.filter((n: any) => n.family === selectedFamily.value)
+    const ids = new Set(nodes.map((n: any) => n.id))
+    const links = g.links.filter((l: any) => ids.has(l.source) && ids.has(l.target))
+    return { nodes, links }
+  })
+
+  return { graph, selectedNode, searchQuery, selectedFamily, filteredCognates, filteredGraph }
 })
