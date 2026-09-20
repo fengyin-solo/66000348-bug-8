@@ -85,33 +85,87 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, watch, onMounted, onUnmounted, onActivated, onDeactivated } from 'vue'
 import * as d3 from 'd3'
 import { useEtymologyStore, LANGUAGE_FAMILIES } from './store/etymology'
 
 const store = useEtymologyStore()
 const svgRef = ref<SVGSVGElement | null>(null)
 const COLORS: Record<string, string> = { ie: '#3b82f6', st: '#22c55e', aa: '#f59e0b', ural: '#8b5cf6' }
+const SVG_HEIGHT = 460
+
+let simulation: d3.Simulation<any, any> | null = null
+let currentG: d3.Selection<SVGGElement, unknown, null, undefined> | null = null
+let resizeObserver: ResizeObserver | null = null
+let drawTimer: ReturnType<typeof setTimeout> | null = null
+let resizeTimer: ReturnType<typeof setTimeout> | null = null
+let lastWidth = 0
+
+// 全组件复用单个 zoom 行为，避免每次重绘叠加监听、共享 __zoom 状态导致缩放越滚越偏
+const zoomBehavior = d3.zoom<SVGSVGElement, unknown>()
+  .scaleExtent([0.2, 3])
+  .on('zoom', (e) => { currentG?.attr('transform', e.transform) })
+
+function clearTimers() {
+  if (drawTimer !== null) { clearTimeout(drawTimer); drawTimer = null }
+  if (resizeTimer !== null) { clearTimeout(resizeTimer); resizeTimer = null }
+}
+
+// 退出旧模拟与事件监听，确保不残留计时任务
+function teardownGraph() {
+  simulation?.stop()
+  simulation = null
+  currentG = null
+  if (svgRef.value) {
+    const svg = d3.select(svgRef.value)
+    svg.on('.zoom', null)
+    svg.selectAll('*').remove()
+  }
+}
 
 function drawGraph() {
   if (!svgRef.value) return
-  const svg = d3.select(svgRef.value)
-  svg.selectAll('*').remove()
-  const W = svgRef.value.getBoundingClientRect().width || 700, H = 460
+  teardownGraph()
+  const svgEl = svgRef.value
+  const measured = svgEl.getBoundingClientRect().width
+  lastWidth = measured
+  const W = measured || 700, H = SVG_HEIGHT
   const nodes = store.graph.nodes.map((n: any) => ({ ...n }))
   const links = store.graph.links.map((l: any) => ({ ...l }))
+  const svg = d3.select(svgEl)
+
+  // 空数据：只画占位提示，不创建模拟
+  if (!nodes.length) {
+    svg.append('text')
+      .attr('x', W / 2).attr('y', H / 2)
+      .attr('text-anchor', 'middle')
+      .attr('font-size', 13).attr('fill', '#64748b')
+      .text('无匹配的词源数据')
+    return
+  }
+
+  const g = svg.append('g')
+  currentG = g
+  svg.call(zoomBehavior)
+  // 缩放状态随重绘归零，不沿用上一轮的位移/惯性
+  svg.call(zoomBehavior.transform, d3.zoomIdentity)
+
   const sim = d3.forceSimulation(nodes as any)
     .force('link', d3.forceLink(links as any).id((d: any) => d.id).distance(55))
     .force('charge', d3.forceManyBody().strength(-100))
     .force('center', d3.forceCenter(W / 2, H / 2))
     .force('collision', d3.forceCollide(22))
-  const g = svg.append('g')
-  svg.call(d3.zoom<SVGSVGElement, unknown>().scaleExtent([0.2, 3]).on('zoom', (e) => g.attr('transform', e.transform)) as any)
+  simulation = sim
+
   const link = g.append('g').selectAll('line').data(links).join('line')
     .attr('stroke', '#475569').attr('stroke-width', 1).attr('opacity', 0.5)
   const node = g.append('g').selectAll('g').data(nodes).join('g')
     .call(d3.drag<any, any>()
-      .on('start', (e, d: any) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y })
+      .on('start', (e, d: any) => {
+        e.sourceEvent?.stopPropagation() // 阻止冒泡触发画布缩放/平移，避免拖动后坐标错位
+        if (!e.active) sim.alphaTarget(0.3).restart()
+        d.fx = d.x; d.fy = d.y
+      })
       .on('drag', (e, d: any) => { d.fx = e.x; d.fy = e.y })
       .on('end', (e, d: any) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null }))
     .on('click', (_: any, d: any) => { store.selectedNode = d })
@@ -129,5 +183,49 @@ function drawGraph() {
   })
 }
 
-onMounted(() => { setTimeout(drawGraph, 100) })
+// 尺寸变化：按当前容器重新落位——保留节点坐标，仅更新向心力并重新加热
+function handleResize() {
+  if (!svgRef.value || drawTimer !== null) return
+  const W = svgRef.value.getBoundingClientRect().width
+  if (!W || Math.abs(W - lastWidth) < 1) return // 容器隐藏或尺寸未变时不动
+  lastWidth = W
+  if (simulation) {
+    simulation.force('center', d3.forceCenter(W / 2, SVG_HEIGHT / 2))
+    simulation.alpha(0.5).restart()
+  } else {
+    drawGraph() // 空数据占位或从隐藏恢复时按当前容器重绘
+  }
+}
+
+// 延迟到布局稳定后按当前容器测量；重复调用只保留最后一次，快速连续切换不会叠加模拟
+function scheduleDraw() {
+  if (drawTimer !== null) clearTimeout(drawTimer)
+  drawTimer = setTimeout(() => { drawTimer = null; drawGraph() }, 100)
+}
+
+function startObserving() {
+  resizeObserver?.disconnect()
+  if (svgRef.value) {
+    resizeObserver = new ResizeObserver(() => {
+      if (resizeTimer !== null) clearTimeout(resizeTimer)
+      resizeTimer = setTimeout(() => { resizeTimer = null; handleResize() }, 150)
+    })
+    resizeObserver.observe(svgRef.value)
+  }
+}
+
+function stopAll() {
+  clearTimers()
+  resizeObserver?.disconnect()
+  resizeObserver = null
+  teardownGraph()
+}
+
+// 筛选（含空结果）变化时重绘；teardownGraph 先同步退出旧模拟与监听
+watch(() => store.graph, scheduleDraw)
+
+onMounted(() => { scheduleDraw(); startObserving() })
+onActivated(() => { scheduleDraw(); startObserving() })
+onDeactivated(stopAll)
+onUnmounted(stopAll)
 </script>

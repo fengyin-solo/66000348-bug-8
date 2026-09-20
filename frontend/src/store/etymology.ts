@@ -4,7 +4,6 @@ import { COGNATE_SETS, LANGUAGE_FAMILIES, buildGraph } from '../mock/data'
 export { LANGUAGE_FAMILIES, COGNATE_SETS }
 
 export const useEtymologyStore = defineStore('etymology', () => {
-  const graph = ref(buildGraph())
   const selectedNode = ref<any>(null)
   const searchQuery = ref('')
   const selectedFamily = ref('all')
@@ -17,6 +16,9 @@ export const useEtymologyStore = defineStore('etymology', () => {
       return matchSearch && matchFamily
     })
   )
+
+  // 图谱数据跟随筛选；无匹配时为空图谱，由视图层兜底
+  const graph = computed(() => buildGraph(filteredCognates.value))
 
   return { graph, selectedNode, searchQuery, selectedFamily, filteredCognates }
 })
